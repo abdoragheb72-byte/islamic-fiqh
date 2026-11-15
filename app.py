@@ -562,14 +562,55 @@ EXPANDED_QUIZ_DATABASE = {
     ]
 }
 
-# 4. إعداد محرك Google Gemini API
-try:
-    GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"].strip()
-except Exception:
-    GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
+# 4. إعداد محرك Google Gemini API (يدعم عدة مفاتيح مع التبديل التلقائي)
+def _load_api_keys():
+    raw = []
+    try:
+        v = st.secrets["GEMINI_API_KEYS"]
+        raw += [v] if isinstance(v, str) else list(v)
+    except Exception:
+        pass
+    try:
+        raw.append(st.secrets["GEMINI_API_KEY"])
+    except Exception:
+        pass
+    raw.append(os.environ.get("GEMINI_API_KEYS", ""))
+    raw.append(os.environ.get("GEMINI_API_KEY", ""))
+    keys = []
+    for item in raw:
+        for k in str(item).replace("\n", ",").split(","):
+            k = k.strip().strip("\"'")
+            if k and k not in keys:
+                keys.append(k)
+    return keys
+
+GEMINI_API_KEYS = _load_api_keys()
+GEMINI_API_KEY = GEMINI_API_KEYS[0] if GEMINI_API_KEYS else ""
 
 if GEMINI_API_KEY:
-     genai.configure(api_key=GEMINI_API_KEY, transport="rest")
+    genai.configure(api_key=GEMINI_API_KEY, transport="rest")
+
+@st.cache_resource(show_spinner=False)
+def _key_state():
+    # مشترك بين كل الزوار: دور المفتاح التالي + المفاتيح الموقوفة مؤقتاً
+    return {"next": 0, "cooldown": {}}
+
+def _ordered_keys():
+    """يوزّع الطلبات دورياً على المفاتيح، ويؤخّر المفاتيح التي نفدت حصتها."""
+    state = _key_state()
+    n = len(GEMINI_API_KEYS)
+    if n == 0:
+        return []
+    start = state["next"] % n
+    state["next"] = (start + 1) % n
+    order = [GEMINI_API_KEYS[(start + i) % n] for i in range(n)]
+    now = time.time()
+    ready = [k for k in order if state["cooldown"].get(k, 0) <= now]
+    return ready or order  # لو كلها موقوفة نجرّبها رغم ذلك
+
+def _cooldown_key(key, seconds):
+    _key_state()["cooldown"][key] = time.time() + seconds
+
 # 5. دوال التنسيق والتنفيذ السريع بـ Gemini وجلب أسعار الذهب
 def format_quranic_text(text: str) -> str:
     if not text:
@@ -857,30 +898,52 @@ def _call_model(model_name, system_inst, user_text, history, stream):
         return model.start_chat(history=history).send_message(user_text, stream=stream, request_options=opts)
     return model.generate_content(user_text, stream=stream, request_options=opts)
 
+def _is_quota_error(message: str) -> bool:
+    low = (message or "").lower()
+    return any(k in low for k in ("429", "quota", "resource_exhausted", "rate limit"))
+
 def _generate_text(system_inst, user_text, history=None, output_container=None):
-    """يجرّب النماذج بالترتيب: بث مباشر ثم طلب عادي عند الرد الفارغ. يرجع (النص، قائمة الأخطاء)."""
+    """يجرّب المفاتيح ثم النماذج: بث مباشر ثم طلب عادي عند الرد الفارغ. يرجع (النص، قائمة الأخطاء)."""
     errors = []
-    for model_name in get_best_model_name():
-        for stream in ((True, False) if output_container is not None else (False,)):
-            try:
-                resp = _call_model(model_name, system_inst, user_text, history, stream)
-                if stream:
-                    text = _stream_to_container(resp, output_container)
-                else:
-                    text = _response_text(resp)
-                if text.strip():
-                    _remember_model(model_name)
-                    return text.strip(), errors
-                reason = _block_reason(resp)
-                errors.append(f"{model_name}: رد فارغ" + (f" (محجوب: {reason})" if reason else ""))
-                continue  # جرّب الطلب العادي على نفس النموذج
-            except Exception as e:
-                msg = str(e)
-                errors.append(f"{model_name}: {msg[:200]}")
-                if _is_fatal_error(msg):
-                    return None, errors
-                _forget_model(model_name)
-                break  # انتقل للنموذج التالي
+    for key in _ordered_keys():
+        genai.configure(api_key=key, transport="rest")
+        key_dead = False
+        tried = soft_fail = quota_hits = 0
+        for model_name in get_best_model_name():
+            tried += 1
+            for stream in ((True, False) if output_container is not None else (False,)):
+                try:
+                    resp = _call_model(model_name, system_inst, user_text, history, stream)
+                    if stream:
+                        text = _stream_to_container(resp, output_container)
+                    else:
+                        text = _response_text(resp)
+                    if text.strip():
+                        _remember_model(model_name)
+                        return text.strip(), errors
+                    reason = _block_reason(resp)
+                    errors.append(f"{model_name}: رد فارغ" + (f" (محجوب: {reason})" if reason else ""))
+                    continue  # جرّب الطلب العادي على نفس النموذج
+                except Exception as e:
+                    msg = str(e)
+                    errors.append(f"{model_name}: {msg[:200]}")
+                    if _is_fatal_error(msg):
+                        key_dead = True
+                    elif _is_quota_error(msg):
+                        quota_hits += 1
+                        soft_fail += 1
+                    elif _is_model_specific_error(msg):
+                        soft_fail += 1
+                        _forget_model(model_name)
+                    else:
+                        _forget_model(model_name)
+                    break  # انتقل للنموذج التالي
+            if key_dead:
+                break
+        if key_dead:
+            _cooldown_key(key, 3600)       # مفتاح غير صالح: نتجاهله ساعة
+        elif quota_hits and soft_fail >= tried:
+            _cooldown_key(key, 300)        # نفدت حصة المفتاح: نريحه 5 دقائق ونجرّب التالي
     return None, errors
 
 def execute_gemini_prompt(prompt, system_inst, output_container=None):
